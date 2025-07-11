@@ -1,0 +1,25 @@
+import("std::core");
+
+fun println(s: ptr<i8>) {
+    var l: i32 = len(s);
+    var ret: ptr<i8>;
+    asm {
+        "mov rax, 1"
+        "syscall"
+        in("rdi") 1
+        in("rsi") s
+        in("rdx") l
+        out("rax") ret
+    }
+
+    var nl: ptr<i8> = "\n";
+    var one: i32 = 1;
+    asm {
+        "mov rax, 1"
+        "syscall"
+        in("rdi") 1
+        in("rsi") nl
+        in("rdx") one
+        out("rax") ret
+    }
+}
