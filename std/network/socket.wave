@@ -1,0 +1,34 @@
+const SYS_SOCKET: i32 = 41;
+const SYS_CONNECT: i32 = 42;
+const SYS_SENDTO: i32 = 44;
+const SYS_RECVFROM: i32 = 45;
+const SYS_CLOSE: i32 = 3;
+
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+
+fun socket(domain: i32, type: i32, protocol: i32) -> i32 {
+    let fd: i32;
+    asm {
+        "mov rax, 41"
+        "syscall"
+        in("rdi") domain
+        in("rsi") type
+        in("rdx") protocol
+        out("rax") fd
+    }
+    return fd;
+}
+
+fun connect(fd: i32, addr: ptr<u8>, addrlen: i32) -> i32 {
+    let r: i32;
+    asm {
+        "mov rax, 42"
+        "syscall"
+        in("rdi") fd
+        in("rsi") addr
+        in("rdx") addrlen
+        out("rax") r
+    }
+    return r;
+}

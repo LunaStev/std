@@ -1,0 +1,29 @@
+import("std::sys");
+
+fun alloc(size: i32) -> ptr<u8> {
+    let addr: ptr<u8>;
+    asm {
+        "mov rax, 9"                // mmap syscall
+        "mov r10, 0"                // fd = 0
+        "mov r8, 0"                 // offset = 0
+        "syscall"
+        in("rdi") 0                 // addr = 0 (let kernel choose)
+        in("rsi") size              // length
+        in("rdx") 3                 // prot = PROT_READ | PROT_WRITE
+        in("r10") 34                // flags = MAP_PRIVATE | MAP_ANONYMOUS
+        in("r8") 0
+        in("r9") 0
+        out("rax") addr
+    }
+    return addr;
+}
+
+fun alloc_zeroed(size: i32) -> ptr<u8> {
+    let ptr: ptr<u8> = alloc(size);
+    let i: i32 = 0;
+    while (i < size) {
+        ptr[i] = 0;
+        i = i + 1;
+    }
+    return ptr;
+}

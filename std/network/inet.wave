@@ -1,0 +1,18 @@
+import("std::mem");
+
+fun make_sockaddr_in(ip: u32, port: u16) -> ptr<u8> {
+    let addr: ptr<u8> = alloc_zeroed(16);
+
+    addr[0] = 2;                     // sin_family = AF_INET
+    addr[1] = 0;                     // upper byte of family (little endian)
+
+    addr[2] = port & 0xFF;           // sin_port (little endian)
+    addr[3] = (port >> 8) & 0xFF;
+
+    addr[4] = ip & 0xFF;             // sin_addr (IPv4, little endian)
+    addr[5] = (ip >> 8) & 0xFF;
+    addr[6] = (ip >> 16) & 0xFF;
+    addr[7] = (ip >> 24) & 0xFF;
+
+    return addr;
+}

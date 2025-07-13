@@ -1,25 +1,25 @@
 import("std::core");
+import("std::sys");
+
+fun write_stdout(s: ptr<i8>) {
+    let length: i32 = len(s);
+    syscall_write(1, s, length);
+}
 
 fun println(s: ptr<i8>) {
-    var l: i32 = len(s);
-    var ret: ptr<i8>;
-    asm {
-        "mov rax, 1"
-        "syscall"
-        in("rdi") 1
-        in("rsi") s
-        in("rdx") l
-        out("rax") ret
-    }
+    write_stdout(s);
 
-    var nl: ptr<i8> = "\n";
-    var one: i32 = 1;
-    asm {
-        "mov rax, 1"
-        "syscall"
-        in("rdi") 1
-        in("rsi") nl
-        in("rdx") one
-        out("rax") ret
-    }
+    let newline: ptr<i8> = "\n";
+    syscall_write(1, newline, 1);
+}
+
+fun readln() -> ptr<i8> {
+    let buf: ptr<i8> = alloc_zeroed(256);
+    let bytes: i32 = syscall_read(0, buf, 255);
+    buf[bytes] = 0;
+    return buf;
+}
+
+fun input() -> ptr<i8> {
+    return readln();
 }
