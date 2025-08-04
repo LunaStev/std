@@ -1,1 +1,408 @@
-// http/lib.wave
+import("std::core::string");
+import("std::mem");
+import("std::network::socket");
+
+const HTTP_MAX_HEADERS: i32 = 32;
+const HTTP_MAX_HEADER_SIZE: i32 = 1024;
+const HTTP_MAX_BODY_SIZE: i32 = 8192;
+
+const HTTP_HEADER_SIZE: i32 = 16; // ptr<i8>(8) + ptr<i8>(8) = 16 bytes
+const HTTP_REQUEST_SIZE: i32 = 560; // ptr<i8>(8) * 3 + [HttpHeader;32](512) + i32(4) * 3 = 560 bytes  
+const HTTP_RESPONSE_SIZE: i32 = 560; // ptr<i8>(8) * 3 + i32(4) + [HttpHeader;32](512) + i32(4) * 2 = 560 bytes
+
+struct HttpHeader {
+    name: ptr<i8>,
+    value: ptr<i8>,
+}
+
+struct HttpRequest {
+    method: ptr<i8>,
+    path: ptr<i8>,
+    version: ptr<i8>,
+    headers: [HttpHeader; HTTP_MAX_HEADERS],
+    header_count: i32,
+    body: ptr<i8>,
+    body_length: i32,
+}
+
+struct HttpResponse {
+    version: ptr<i8>,
+    status_code: i32,
+    status_text: ptr<i8>,
+    headers: [HttpHeader; HTTP_MAX_HEADERS],
+    header_count: i32,
+    body: ptr<i8>,
+    body_length: i32,
+}
+
+fun skip_whitespace(data: str, pos: ptr<i32>) {
+    while (data[deref pos] == 32 || data[deref pos] == 9) { // space or tab
+        deref pos = deref pos + 1;
+    }
+}
+
+fun find_line_end(data: str, start: i32) -> i32 {
+    let mut i: i32 = start;
+    while (data[i] != 0 && data[i] != 10) { // not null or '\n'
+        i = i + 1;
+    }
+    return i;
+}
+
+fun parse_request_line(data: str, req: ptr<HttpRequest>) -> i32 {
+    let mut pos: i32 = 0;
+    let mut start: i32;
+    let mut end: i32;
+    
+    // Parse method
+    start = pos;
+    while (data[pos] != 0 && data[pos] != 32) { // not null or space
+        pos = pos + 1;
+    }
+    if (data[pos] == 0) {
+        return -1;
+    }
+    
+    end = pos;
+    req.method = alloc(end - start + 1);
+    if (req.method == 0 as ptr<i8>) {
+        return -1;
+    }
+    copy(req.method, data + start, end - start + 1);
+    
+    skip_whitespace(data, &pos);
+    
+    // Parse path
+    start = pos;
+    while (data[pos] != 0 && data[pos] != 32) {
+        pos = pos + 1;
+    }
+    if (data[pos] == 0) {
+        return -1;
+    }
+    
+    end = pos;
+    req.path = alloc(end - start + 1);
+    if (req.path == 0 as ptr<i8>) {
+        return -1;
+    }
+    copy(req.path, data + start, end - start + 1);
+    
+    skip_whitespace(data, &pos);
+    
+    // Parse version
+    start = pos;
+    end = find_line_end(data, start);
+    if (end > start && data[end - 1] == 13) { // '\r'
+        end = end - 1;
+    }
+    
+    req.version = alloc(end - start + 1);
+    if (req.version == 0 as ptr<i8>) {
+        return -1;
+    }
+    copy(req.version, data + start, end - start + 1);
+    
+    return find_line_end(data, pos) + 1;
+}
+
+fun parse_header_line(data: str, start: i32, header: ptr<HttpHeader>) -> i32 {
+    let mut pos: i32 = start;
+    let mut colon_pos: i32 = -1;
+    let mut end: i32;
+    
+    // Find colon
+    while (data[pos] != 0 && data[pos] != 10) {
+        if (data[pos] == 58) { // ':'
+            colon_pos = pos;
+            break;
+        }
+        pos = pos + 1;
+    }
+    
+    if (colon_pos == -1) {
+        return -1;
+    }
+    
+    // Parse header name
+    header.name = alloc(colon_pos - start + 1);
+    if (header.name == 0 as ptr<i8>) {
+        return -1;
+    }
+    copy(header.name, data + start, colon_pos - start + 1);
+    
+    // Parse header value
+    pos = colon_pos + 1;
+    skip_whitespace(data, &pos);
+    
+    end = find_line_end(data, pos);
+    if (end > pos && data[end - 1] == 13) { // '\r'
+        end = end - 1;
+    }
+    
+    header.value = alloc(end - pos + 1);
+    if (header.value == 0 as ptr<i8>) {
+        return -1;
+    }
+    copy(header.value, data + pos, end - pos + 1);
+    
+    return find_line_end(data, start) + 1;
+}
+
+fun parse_http_request(data: str, req: ptr<HttpRequest>) -> i32 {
+    let mut pos: i32 = 0;
+    let mut line_end: i32;
+    
+    // Initialize request
+    req.method = 0 as ptr<i8>;
+    req.path = 0 as ptr<i8>;
+    req.version = 0 as ptr<i8>;
+    req.header_count = 0;
+    req.body = 0 as ptr<i8>;
+    req.body_length = 0;
+    
+    // Parse request line
+    pos = parse_request_line(data, req);
+    if (pos < 0) {
+        return -1;
+    }
+    
+    // Parse headers
+    while (data[pos] != 0 && req.header_count < HTTP_MAX_HEADERS) {
+        // Check for empty line (end of headers)
+        if (data[pos] == 13 && data[pos + 1] == 10) { // "\r\n"
+            pos = pos + 2;
+            break;
+        }
+        if (data[pos] == 10) { // "\n"
+            pos = pos + 1;
+            break;
+        }
+        
+        let next_pos: i32 = parse_header_line(data, pos, &req.headers[req.header_count]);
+        if (next_pos < 0) {
+            break;
+        }
+        
+        req.header_count = req.header_count + 1;
+        pos = next_pos;
+    }
+    
+    // Parse body if present
+    if (data[pos] != 0) {
+        let body_start: i32 = pos;
+        let body_len: i32 = len(data + pos);
+        
+        if (body_len > 0) {
+            req.body = alloc(body_len + 1);
+            if (req.body != 0 as ptr<i8>) {
+                copy(req.body, data + pos, body_len + 1);
+                req.body_length = body_len;
+            }
+        }
+    }
+    
+    return 0;
+}
+
+fun free_http_request(req: ptr<HttpRequest>) {
+    if (req.method != 0 as ptr<i8>) {
+        free(req.method);
+    }
+    if (req.path != 0 as ptr<i8>) {
+        free(req.path);
+    }
+    if (req.version != 0 as ptr<i8>) {
+        free(req.version);
+    }
+    
+    let mut i: i32 = 0;
+    while (i < req.header_count) {
+        if (req.headers[i].name != 0 as ptr<i8>) {
+            free(req.headers[i].name);
+        }
+        if (req.headers[i].value != 0 as ptr<i8>) {
+            free(req.headers[i].value);
+        }
+        i = i + 1;
+    }
+    
+    if (req.body != 0 as ptr<i8>) {
+        free(req.body);
+    }
+}
+
+fun create_http_response(status_code: i32, status_text: str, body: str) -> ptr<HttpResponse> {
+    let resp: ptr<HttpResponse> = alloc(HTTP_RESPONSE_SIZE) as ptr<HttpResponse>;
+    if (resp == 0 as ptr<HttpResponse>) {
+        return 0 as ptr<HttpResponse>;
+    }
+    
+    // Set version
+    resp.version = alloc(9);
+    if (resp.version == 0 as ptr<i8>) {
+        free(resp);
+        return 0 as ptr<HttpResponse>;
+    }
+    copy(resp.version, "HTTP/1.1", 9);
+    
+    // Set status
+    resp.status_code = status_code;
+    let status_len: i32 = len(status_text);
+    resp.status_text = alloc(status_len + 1);
+    if (resp.status_text == 0 as ptr<i8>) {
+        free(resp.version);
+        free(resp);
+        return 0 as ptr<HttpResponse>;
+    }
+    copy(resp.status_text, status_text, status_len + 1);
+    
+    // Set body
+    if (body != 0 as str) {
+        let body_len: i32 = len(body);
+        resp.body = alloc(body_len + 1);
+        if (resp.body != 0 as ptr<i8>) {
+            copy(resp.body, body, body_len + 1);
+            resp.body_length = body_len;
+        } else {
+            resp.body_length = 0;
+        }
+    } else {
+        resp.body = 0 as ptr<i8>;
+        resp.body_length = 0;
+    }
+    
+    resp.header_count = 0;
+    
+    return resp;
+}
+
+fun add_response_header(resp: ptr<HttpResponse>, name: str, value: str) -> i32 {
+    if (resp.header_count >= HTTP_MAX_HEADERS) {
+        return -1;
+    }
+    
+    let name_len: i32 = len(name);
+    let value_len: i32 = len(value);
+    
+    resp.headers[resp.header_count].name = alloc(name_len + 1);
+    if (resp.headers[resp.header_count].name == 0 as ptr<i8>) {
+        return -1;
+    }
+    copy(resp.headers[resp.header_count].name, name, name_len + 1);
+    
+    resp.headers[resp.header_count].value = alloc(value_len + 1);
+    if (resp.headers[resp.header_count].value == 0 as ptr<i8>) {
+        free(resp.headers[resp.header_count].name);
+        return -1;
+    }
+    copy(resp.headers[resp.header_count].value, value, value_len + 1);
+    
+    resp.header_count = resp.header_count + 1;
+    return 0;
+}
+
+fun serialize_http_response(resp: ptr<HttpResponse>) -> ptr<i8> {
+    // Calculate total size needed
+    let mut total_size: i32 = 0;
+    
+    // Status line: "HTTP/1.1 200 OK\r\n"
+    total_size = total_size + len(resp.version) + 1 + 3 + 1 + len(resp.status_text) + 2;
+    
+    // Headers
+    let mut i: i32 = 0;
+    while (i < resp.header_count) {
+        total_size = total_size + len(resp.headers[i].name) + 2 + len(resp.headers[i].value) + 2;
+        i = i + 1;
+    }
+    
+    // Content-Length header if we have body
+    if (resp.body_length > 0) {
+        total_size = total_size + 16 + 10 + 2; // "Content-Length: " + digits + "\r\n"
+    }
+    
+    // Empty line + body
+    total_size = total_size + 2 + resp.body_length;
+    
+    let buffer: ptr<i8> = alloc(total_size + 1);
+    if (buffer == 0 as ptr<i8>) {
+        return 0 as ptr<i8>;
+    }
+    
+    let mut pos: i32 = 0;
+    
+    // Status line
+    pos = pos + copy(buffer + pos, resp.version, total_size - pos);
+    buffer[pos] = 32; pos = pos + 1; // space
+    
+    // Convert status code to string
+    let status_str: [i8; 16];
+    int_to_string(resp.status_code, status_str, 16);
+    pos = pos + copy(buffer + pos, status_str, total_size - pos);
+    
+    buffer[pos] = 32; pos = pos + 1; // space
+    pos = pos + copy(buffer + pos, resp.status_text, total_size - pos);
+    buffer[pos] = 13; pos = pos + 1; // '\r'
+    buffer[pos] = 10; pos = pos + 1; // '\n'
+    
+    // Headers
+    i = 0;
+    while (i < resp.header_count) {
+        pos = pos + copy(buffer + pos, resp.headers[i].name, total_size - pos);
+        buffer[pos] = 58; pos = pos + 1; // ':'
+        buffer[pos] = 32; pos = pos + 1; // space
+        pos = pos + copy(buffer + pos, resp.headers[i].value, total_size - pos);
+        buffer[pos] = 13; pos = pos + 1; // '\r'
+        buffer[pos] = 10; pos = pos + 1; // '\n'
+        i = i + 1;
+    }
+    
+    // Content-Length header
+    if (resp.body_length > 0) {
+        pos = pos + copy(buffer + pos, "Content-Length: ", total_size - pos);
+        let content_len_str: [i8; 16];
+        int_to_string(resp.body_length, content_len_str, 16);
+        pos = pos + copy(buffer + pos, content_len_str, total_size - pos);
+        buffer[pos] = 13; pos = pos + 1; // '\r'
+        buffer[pos] = 10; pos = pos + 1; // '\n'
+    }
+    
+    // Empty line
+    buffer[pos] = 13; pos = pos + 1; // '\r'
+    buffer[pos] = 10; pos = pos + 1; // '\n'
+    
+    // Body
+    if (resp.body_length > 0) {
+        pos = pos + copy(buffer + pos, resp.body, total_size - pos);
+    }
+    
+    buffer[pos] = 0; // null terminator
+    
+    return buffer;
+}
+
+fun free_http_response(resp: ptr<HttpResponse>) {
+    if (resp.version != 0 as ptr<i8>) {
+        free(resp.version);
+    }
+    if (resp.status_text != 0 as ptr<i8>) {
+        free(resp.status_text);
+    }
+    
+    let mut i: i32 = 0;
+    while (i < resp.header_count) {
+        if (resp.headers[i].name != 0 as ptr<i8>) {
+            free(resp.headers[i].name);
+        }
+        if (resp.headers[i].value != 0 as ptr<i8>) {
+            free(resp.headers[i].value);
+        }
+        i = i + 1;
+    }
+    
+    if (resp.body != 0 as ptr<i8>) {
+        free(resp.body);
+    }
+    
+    free(resp);
+}

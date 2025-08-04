@@ -1,1 +1,1 @@
-import("syscall");
+import("std::sys::syscall");

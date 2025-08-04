@@ -1,0 +1,300 @@
+import("std::http");
+import("std::network::socket");
+import("std::core::string");
+import("std::mem");
+
+const HTTP_SERVER_SIZE: i32 = 16; // i32(4) + i16(2) + i32(4) + padding(6) = 16 bytes
+const CLIENT_CONNECTION_SIZE: i32 = 16; // i32(4) + ptr<sockaddr_in>(8) + padding(4) = 16 bytes
+const ROUTE_SIZE: i32 = 32; // ptr<i8>(8) + ptr<i8>(8) + fun(8) + ptr<Route>(8) = 32 bytes
+const ROUTER_SIZE: i32 = 8; // ptr<Route>(8) = 8 bytes
+
+struct HttpServer {
+    socket_fd: i32,
+    port: i16,
+    running: i32,
+}
+
+struct ClientConnection {
+    socket_fd: i32,
+    addr: ptr<sockaddr_in>,
+}
+
+fun create_http_server(port: i16) -> ptr<HttpServer> {
+    let server: ptr<HttpServer> = alloc(HTTP_SERVER_SIZE) as ptr<HttpServer>;
+    if (server == 0 as ptr<HttpServer>) {
+        return 0 as ptr<HttpServer>;
+    }
+    
+    server.socket_fd = -1;
+    server.port = port;
+    server.running = 0;
+    
+    return server;
+}
+
+fun http_server_start(server: ptr<HttpServer>) -> i32 {
+    // Create socket
+    server.socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server.socket_fd < 0) {
+        return -1;
+    }
+    
+    // Enable SO_REUSEADDR
+    let opt: i32 = 1;
+    // Note: setsockopt would be needed here in a full implementation
+    // For now, we'll skip it for simplicity
+    
+    // Create server address
+    let server_addr: ptr<sockaddr_in> = create_sockaddr_in("0.0.0.0", server.port);
+    if (server_addr == 0 as ptr<sockaddr_in>) {
+        close_socket(server.socket_fd);
+        return -1;
+    }
+    
+    // Bind
+    let bind_result: i32 = bind(server.socket_fd, server_addr as ptr<u8>, SOCKADDR_IN_SIZE);
+    free(server_addr);
+    
+    if (bind_result < 0) {
+        close_socket(server.socket_fd);
+        return -1;
+    }
+    
+    // Listen
+    if (listen(server.socket_fd, 10) < 0) {
+        close_socket(server.socket_fd);
+        return -1;
+    }
+    
+    server.running = 1;
+    return 0;
+}
+
+fun http_server_accept(server: ptr<HttpServer>) -> ptr<ClientConnection> {
+    if (server.running == 0) {
+        return 0 as ptr<ClientConnection>;
+    }
+    
+    let client_addr: ptr<sockaddr_in> = alloc(SOCKADDR_IN_SIZE) as ptr<sockaddr_in>;
+    if (client_addr == 0 as ptr<sockaddr_in>) {
+        return 0 as ptr<ClientConnection>;
+    }
+    
+    let addr_len: i32 = SOCKADDR_IN_SIZE;
+    let client_fd: i32 = accept(server.socket_fd, client_addr as ptr<u8>, &addr_len);
+    
+    if (client_fd < 0) {
+        free(client_addr);
+        return 0 as ptr<ClientConnection>;
+    }
+    
+    let connection: ptr<ClientConnection> = alloc(CLIENT_CONNECTION_SIZE) as ptr<ClientConnection>;
+    if (connection == 0 as ptr<ClientConnection>) {
+        close_socket(client_fd);
+        free(client_addr);
+        return 0 as ptr<ClientConnection>;
+    }
+    
+    connection.socket_fd = client_fd;
+    connection.addr = client_addr;
+    
+    return connection;
+}
+
+fun http_server_receive_request(connection: ptr<ClientConnection>) -> ptr<HttpRequest> {
+    let buffer: ptr<i8> = alloc(8192);
+    if (buffer == 0 as ptr<i8>) {
+        return 0 as ptr<HttpRequest>;
+    }
+    
+    let total_received: i32 = 0;
+    let mut bytes_received: i32;
+    
+    // Receive data
+    while (total_received < 8191) {
+        bytes_received = recv(connection.socket_fd, (buffer + total_received) as ptr<u8>, 8191 - total_received, 0);
+        if (bytes_received <= 0) {
+            break;
+        }
+        total_received = total_received + bytes_received;
+        
+        // Check if we have received the end of headers
+        if (total_received >= 4) {
+            let end_check_pos: i32 = total_received - 4;
+            if (buffer[end_check_pos] == 13 && buffer[end_check_pos + 1] == 10 && 
+                buffer[end_check_pos + 2] == 13 && buffer[end_check_pos + 3] == 10) {
+                break; // End of HTTP headers found
+            }
+        }
+        if (total_received >= 2) {
+            let end_check_pos: i32 = total_received - 2;
+            if (buffer[end_check_pos] == 10 && buffer[end_check_pos + 1] == 10) {
+                break; // End of HTTP headers found (simple \n\n)
+            }
+        }
+    }
+    
+    buffer[total_received] = 0;
+    
+    // Parse request
+    let request: ptr<HttpRequest> = alloc(HTTP_REQUEST_SIZE) as ptr<HttpRequest>;
+    if (request == 0 as ptr<HttpRequest>) {
+        free(buffer);
+        return 0 as ptr<HttpRequest>;
+    }
+    
+    let parse_result: i32 = parse_http_request(buffer, request);
+    free(buffer);
+    
+    if (parse_result < 0) {
+        free(request);
+        return 0 as ptr<HttpRequest>;
+    }
+    
+    return request;
+}
+
+fun http_server_send_response(connection: ptr<ClientConnection>, response: ptr<HttpResponse>) -> i32 {
+    let response_data: ptr<i8> = serialize_http_response(response);
+    if (response_data == 0 as ptr<i8>) {
+        return -1;
+    }
+    
+    let response_len: i32 = len(response_data);
+    let bytes_sent: i32 = send(connection.socket_fd, response_data as ptr<u8>, response_len, 0);
+    
+    free(response_data);
+    
+    if (bytes_sent != response_len) {
+        return -1;
+    }
+    
+    return 0;
+}
+
+fun http_server_close_connection(connection: ptr<ClientConnection>) {
+    if (connection.socket_fd >= 0) {
+        close_socket(connection.socket_fd);
+    }
+    if (connection.addr != 0 as ptr<sockaddr_in>) {
+        free(connection.addr);
+    }
+    free(connection);
+}
+
+fun http_server_stop(server: ptr<HttpServer>) {
+    if (server.running == 1) {
+        close_socket(server.socket_fd);
+        server.running = 0;
+        server.socket_fd = -1;
+    }
+}
+
+fun free_http_server(server: ptr<HttpServer>) {
+    if (server.running == 1) {
+        close_socket(server.socket_fd);
+    }
+    free(server);
+}
+
+// Utility functions for common responses
+fun create_simple_response(status_code: i32, status_text: str, body: str) -> ptr<HttpResponse> {
+    let response: ptr<HttpResponse> = create_http_response(status_code, status_text, body);
+    if (response == 0 as ptr<HttpResponse>) {
+        return 0 as ptr<HttpResponse>;
+    }
+    
+    // Add basic headers
+    add_response_header(response, "Content-Type", "text/html; charset=utf-8");
+    add_response_header(response, "Connection", "close");
+    
+    return response;
+}
+
+fun create_json_response(status_code: i32, status_text: str, json_body: str) -> ptr<HttpResponse> {
+    let response: ptr<HttpResponse> = create_http_response(status_code, status_text, json_body);
+    if (response == 0 as ptr<HttpResponse>) {
+        return 0 as ptr<HttpResponse>;
+    }
+    
+    // Add JSON headers
+    add_response_header(response, "Content-Type", "application/json; charset=utf-8");
+    add_response_header(response, "Connection", "close");
+    
+    return response;
+}
+
+fun create_404_response() -> ptr<HttpResponse> {
+    return create_simple_response(404, "Not Found", "<html><body><h1>404 Not Found</h1></body></html>");
+}
+
+fun create_500_response() -> ptr<HttpResponse> {
+    return create_simple_response(500, "Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
+}
+
+// Simple router structure
+struct Route {
+    method: ptr<i8>,
+    path: ptr<i8>,
+    handler: fun(ptr<HttpRequest>) -> ptr<HttpResponse>,
+    next: ptr<Route>,
+}
+
+struct Router {
+    routes: ptr<Route>,
+}
+
+fun create_router() -> ptr<Router> {
+    let router: ptr<Router> = alloc(ROUTER_SIZE) as ptr<Router>;
+    if (router == 0 as ptr<Router>) {
+        return 0 as ptr<Router>;
+    }
+    
+    router.routes = 0 as ptr<Route>;
+    return router;
+}
+
+fun add_route(router: ptr<Router>, method: str, path: str, handler: fun(ptr<HttpRequest>) -> ptr<HttpResponse>) -> i32 {
+    let route: ptr<Route> = alloc(ROUTE_SIZE) as ptr<Route>;
+    if (route == 0 as ptr<Route>) {
+        return -1;
+    }
+    
+    let method_len: i32 = len(method);
+    let path_len: i32 = len(path);
+    
+    route.method = alloc(method_len + 1);
+    if (route.method == 0 as ptr<i8>) {
+        free(route);
+        return -1;
+    }
+    copy(route.method, method, method_len + 1);
+    
+    route.path = alloc(path_len + 1);
+    if (route.path == 0 as ptr<i8>) {
+        free(route.method);
+        free(route);
+        return -1;
+    }
+    copy(route.path, path, path_len + 1);
+    
+    route.handler = handler;
+    route.next = router.routes;
+    router.routes = route;
+    
+    return 0;
+}
+
+fun route_request(router: ptr<Router>, request: ptr<HttpRequest>) -> ptr<HttpResponse> {
+    let current: ptr<Route> = router.routes;
+    
+    while (current != 0 as ptr<Route>) {
+        if (compare(current.method, request.method) == 0 && 
+            compare(current.path, request.path) == 0) {
+            return current.handler(request);
+        }
+        current = current.next;
+    }
+    
+    return create_404_response();
+}

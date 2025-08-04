@@ -1,5 +1,6 @@
-import("std::core");
-import("std::sys");
+import("std::core::string");
+import("std::sys::syscall");
+import("std::mem::alloc");
 
 fun write_stdout(s: ptr<i8>) {
     let length: i32 = len(s);

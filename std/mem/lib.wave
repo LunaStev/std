@@ -1,1 +1,1 @@
-import("alloc");
+import("std::mem::alloc");

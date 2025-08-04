@@ -1,11 +1,27 @@
+import("std::sys");
+import("std::mem");
+
 const SYS_SOCKET: i32 = 41;
 const SYS_CONNECT: i32 = 42;
+const SYS_BIND: i32 = 49;
+const SYS_LISTEN: i32 = 50;
+const SYS_ACCEPT: i32 = 43;
 const SYS_SENDTO: i32 = 44;
 const SYS_RECVFROM: i32 = 45;
 const SYS_CLOSE: i32 = 3;
 
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
+const SOCK_DGRAM: i32 = 2;
+
+struct sockaddr_in {
+    sin_family: i16,
+    sin_port: i16,
+    sin_addr: i32,
+    sin_zero: [i8; 8],
+}
+
+const SOCKADDR_IN_SIZE: i32 = 16; // i16(2) + i16(2) + i32(4) + [i8;8](8) = 16 bytes
 
 fun socket(domain: i32, type: i32, protocol: i32) -> i32 {
     let fd: i32;
@@ -31,4 +47,128 @@ fun connect(fd: i32, addr: ptr<u8>, addrlen: i32) -> i32 {
         out("rax") r
     }
     return r;
+}
+
+fun bind(fd: i32, addr: ptr<u8>, addrlen: i32) -> i32 {
+    let r: i32;
+    asm {
+        "mov rax, 49"
+        "syscall"
+        in("rdi") fd
+        in("rsi") addr
+        in("rdx") addrlen
+        out("rax") r
+    }
+    return r;
+}
+
+fun listen(fd: i32, backlog: i32) -> i32 {
+    let r: i32;
+    asm {
+        "mov rax, 50"
+        "syscall"
+        in("rdi") fd
+        in("rsi") backlog
+        out("rax") r
+    }
+    return r;
+}
+
+fun accept(fd: i32, addr: ptr<u8>, addrlen: ptr<i32>) -> i32 {
+    let r: i32;
+    asm {
+        "mov rax, 43"
+        "syscall"
+        in("rdi") fd
+        in("rsi") addr
+        in("rdx") addrlen
+        out("rax") r
+    }
+    return r;
+}
+
+fun send(fd: i32, buf: ptr<u8>, len: i32, flags: i32) -> i32 {
+    let r: i32;
+    asm {
+        "mov rax, 44"
+        "syscall"
+        in("rdi") fd
+        in("rsi") buf
+        in("rdx") len
+        in("r10") flags
+        out("rax") r
+    }
+    return r;
+}
+
+fun recv(fd: i32, buf: ptr<u8>, len: i32, flags: i32) -> i32 {
+    let r: i32;
+    asm {
+        "mov rax, 45"
+        "syscall"
+        in("rdi") fd
+        in("rsi") buf
+        in("rdx") len
+        in("r10") flags
+        out("rax") r
+    }
+    return r;
+}
+
+fun close_socket(fd: i32) -> i32 {
+    return syscall_close(fd);
+}
+
+fun htons(hostshort: i16) -> i16 {
+    return ((hostshort & 0xFF) << 8) | ((hostshort >> 8) & 0xFF);
+}
+
+fun htonl(hostlong: i32) -> i32 {
+    return ((hostlong & 0xFF) << 24) | 
+           (((hostlong >> 8) & 0xFF) << 16) | 
+           (((hostlong >> 16) & 0xFF) << 8) | 
+           ((hostlong >> 24) & 0xFF);
+}
+
+fun inet_addr(ip_str: str) -> i32 {
+    let mut result: i32 = 0;
+    let mut octet: i32 = 0;
+    let mut i: i32 = 0;
+    let mut shift: i32 = 24;
+    
+    while (ip_str[i] != 0 && shift >= 0) {
+        if (ip_str[i] == 46) { // '.'
+            result = result | (octet << shift);
+            shift = shift - 8;
+            octet = 0;
+        } else if (ip_str[i] >= 48 && ip_str[i] <= 57) { // '0' to '9'
+            octet = octet * 10 + (ip_str[i] - 48);
+        }
+        i = i + 1;
+    }
+    
+    if (shift >= 0) {
+        result = result | (octet << shift);
+    }
+    
+    return result;
+}
+
+fun create_sockaddr_in(ip: str, port: i16) -> ptr<sockaddr_in> {
+    let addr: ptr<sockaddr_in> = alloc(SOCKADDR_IN_SIZE) as ptr<sockaddr_in>;
+    if (addr == 0 as ptr<sockaddr_in>) {
+        return 0 as ptr<sockaddr_in>;
+    }
+    
+    addr.sin_family = htons(AF_INET as i16);
+    addr.sin_port = htons(port);
+    addr.sin_addr = htonl(inet_addr(ip));
+    
+    let mut i: i32 = 0;
+    while (i < 8) {
+        addr.sin_zero[i] = 0;
+        i = i + 1;
+    }
+    
+    return addr;
 }

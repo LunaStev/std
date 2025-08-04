@@ -1,29 +1,143 @@
 import("std::sys");
 
-fun alloc(size: i32) -> ptr<u8> {
-    let addr: ptr<u8>;
-    asm {
-        "mov rax, 9"                // mmap syscall
-        "mov r10, 0"                // fd = 0
-        "mov r8, 0"                 // offset = 0
-        "syscall"
-        in("rdi") 0                 // addr = 0 (let kernel choose)
-        in("rsi") size              // length
-        in("rdx") 3                 // prot = PROT_READ | PROT_WRITE
-        in("r10") 34                // flags = MAP_PRIVATE | MAP_ANONYMOUS
-        in("r8") 0
-        in("r9") 0
-        out("rax") addr
+struct MemBlock {
+    size: i32,
+    next: ptr<MemBlock>,
+}
+
+const MEMBLOCK_SIZE: i32 = 12; // i32(4) + ptr(8) = 12 bytes
+
+let mut g_heap_start: ptr<u8> = 0 as ptr<u8>;
+let mut g_heap_size: i32 = 0;
+let mut g_free_list: ptr<MemBlock> = 0 as ptr<MemBlock>;
+
+fun init_heap() {
+    if (g_heap_start == 0 as ptr<u8>) {
+        g_heap_size = 4096 * 256; // 1MB initial heap
+        g_heap_start = syscall_mmap(0 as ptr<u8>, g_heap_size, 3, 34, -1, 0);
+        if (g_heap_start == -1 as ptr<u8>) {
+            // heap initialization failed
+            return;
+        }
+        
+        // Initialize free list with entire heap
+        g_free_list = g_heap_start as ptr<MemBlock>;
+        g_free_list.size = g_heap_size - MEMBLOCK_SIZE;
+        g_free_list.next = 0 as ptr<MemBlock>;
     }
-    return addr;
+}
+
+fun alloc(size: i32) -> ptr<u8> {
+    init_heap();
+    
+    let aligned_size: i32 = (size + 7) & ~7; // 8-byte alignment
+    let total_size: i32 = aligned_size + MEMBLOCK_SIZE;
+    
+    let mut current: ptr<MemBlock> = g_free_list;
+    let mut prev: ptr<MemBlock> = 0 as ptr<MemBlock>;
+    
+    while (current != 0 as ptr<MemBlock>) {
+        if (current.size >= total_size) {
+            // Found suitable block
+            let remaining: i32 = current.size - total_size;
+            
+            if (remaining > MEMBLOCK_SIZE) {
+                // Split the block
+                let new_block: ptr<MemBlock> = (current as ptr<u8> + total_size) as ptr<MemBlock>;
+                new_block.size = remaining - MEMBLOCK_SIZE;
+                new_block.next = current.next;
+                current.size = aligned_size;
+                current.next = new_block;
+            } else {
+                // Use entire block
+                if (prev != 0 as ptr<MemBlock>) {
+                    prev.next = current.next;
+                } else {
+                    g_free_list = current.next;
+                }
+            }
+            
+            return (current as ptr<u8> + MEMBLOCK_SIZE);
+        }
+        
+        prev = current;
+        current = current.next;
+    }
+    
+    // No suitable block found, expand heap
+    let new_size: i32 = g_heap_size * 2;
+    let new_heap: ptr<u8> = syscall_mmap(0 as ptr<u8>, new_size, 3, 34, -1, 0);
+    if (new_heap == -1 as ptr<u8>) {
+        return 0 as ptr<u8>; // allocation failed
+    }
+    
+    // Add new heap area to free list
+    let new_block: ptr<MemBlock> = new_heap as ptr<MemBlock>;
+    new_block.size = new_size - MEMBLOCK_SIZE;
+    new_block.next = g_free_list;
+    g_free_list = new_block;
+    
+    return alloc(size); // retry allocation
+}
+
+fun free(ptr: ptr<u8>) {
+    if (ptr == 0 as ptr<u8>) {
+        return;
+    }
+    
+    let block: ptr<MemBlock> = (ptr - MEMBLOCK_SIZE) as ptr<MemBlock>;
+    
+    // Add block to free list (simple insertion at head)
+    block.next = g_free_list;
+    g_free_list = block;
+    
+    // TODO: Coalesce adjacent free blocks for better memory efficiency
 }
 
 fun alloc_zeroed(size: i32) -> ptr<u8> {
     let ptr: ptr<u8> = alloc(size);
+    if (ptr == 0 as ptr<u8>) {
+        return ptr;
+    }
+    
     let i: i32 = 0;
     while (i < size) {
         ptr[i] = 0;
         i = i + 1;
     }
     return ptr;
+}
+
+fun realloc(ptr: ptr<u8>, new_size: i32) -> ptr<u8> {
+    if (ptr == 0 as ptr<u8>) {
+        return alloc(new_size);
+    }
+    
+    if (new_size == 0) {
+        free(ptr);
+        return 0 as ptr<u8>;
+    }
+    
+    let old_block: ptr<MemBlock> = (ptr - MEMBLOCK_SIZE) as ptr<MemBlock>;
+    let old_size: i32 = old_block.size;
+    
+    if (new_size <= old_size) {
+        return ptr; // shrinking or same size, keep same block
+    }
+    
+    // Need larger block
+    let new_ptr: ptr<u8> = alloc(new_size);
+    if (new_ptr == 0 as ptr<u8>) {
+        return 0 as ptr<u8>;
+    }
+    
+    // Copy old data
+    let i: i32 = 0;
+    while (i < old_size) {
+        new_ptr[i] = ptr[i];
+        i = i + 1;
+    }
+    
+    free(ptr);
+    return new_ptr;
 }
